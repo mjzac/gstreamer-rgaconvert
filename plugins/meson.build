@@ -5,7 +5,9 @@ plugin_sources = [
   'gstrgaconvert.c',
   'gstrgaconvert.h',
   'dmaheap.c',
-  'dmaheap.h'
+  'dmaheap.h',
+  'gstrgadmabufpool.c',
+  'gstrgadmabufpool.h'
 ]
 
 shlib = shared_library('gstrgaconvert',
