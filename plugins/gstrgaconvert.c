@@ -49,6 +49,7 @@
 #endif
 
 #include "gstrgaconvert.h"
+#include "gstrgadmabufpool.h"
 #include "rga/im2d.h"
 #include <gst/allocators/gstdmabuf.h>
 #include <gst/gst.h>
@@ -614,61 +615,64 @@ gst_rga_convert_fixate_caps(GstBaseTransform *trans, GstPadDirection direction,
  * 1080-wide result of rotating 1080p by 90 degrees would otherwise violate.
  */
 static gboolean
-gst_rga_convert_decide_allocation(GstBaseTransform *trans, GstQuery *query)
+gst_rga_convert_decide_allocation (GstBaseTransform *trans, GstQuery *query)
 {
-    GstCaps          *outcaps = NULL;
-    GstBufferPool    *pool    = NULL;
-    guint             size, min, max;
-    GstStructure     *config;
-    GstVideoInfo      info;
-    GstVideoAlignment align;
-    gint              i;
+    GstCaps       *outcaps = NULL;
+    GstBufferPool *pool    = NULL;
+    GstStructure  *config;
+    GstVideoInfo   info;
+    guint          size = 0, min = 0, max = 0;
 
-    if (!GST_BASE_TRANSFORM_CLASS(gst_rga_convert_parent_class)->decide_allocation(trans, query))
-        return FALSE;
+    gst_query_parse_allocation (query, &outcaps, NULL);
+    if (outcaps == NULL || !gst_video_info_from_caps (&info, outcaps))
+        return GST_BASE_TRANSFORM_CLASS (gst_rga_convert_parent_class)
+            ->decide_allocation (trans, query);
 
-    if (gst_query_get_n_allocation_pools(query) == 0)
-        return TRUE;
-
-    gst_query_parse_nth_allocation_pool(query, 0, &pool, &size, &min, &max);
-    if (pool == NULL)
-        return TRUE;
-
-    gst_query_parse_allocation(query, &outcaps, NULL);
-    if (outcaps == NULL || !gst_video_info_from_caps(&info, outcaps))
-    {
-        gst_object_unref(pool);
-        return TRUE;
+    pool = gst_rga_dmabuf_pool_new ();
+    if (pool == NULL) {
+        GST_WARNING_OBJECT (trans, "no dma-heap available; falling back to "
+                                   "non-zero-copy output path");
+        return GST_BASE_TRANSFORM_CLASS (gst_rga_convert_parent_class)
+            ->decide_allocation (trans, query);
     }
 
-    config = gst_buffer_pool_get_config(pool);
-    gst_buffer_pool_config_add_option(config, GST_BUFFER_POOL_OPTION_VIDEO_META);
+    /* Honour downstream's requested buffer counts if it offered a pool. */
+    if (gst_query_get_n_allocation_pools (query) > 0)
+        gst_query_parse_nth_allocation_pool (query, 0, NULL, NULL, &min, &max);
+    if (min < 2)
+        min = 2;
 
-    if (gst_buffer_pool_has_option(pool, GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT))
-    {
-        gst_video_alignment_reset(&align);
-        for (i = 0; i < GST_VIDEO_MAX_PLANES; i++)
-            align.stride_align[i] = 15; /* round strides up to a multiple of 16 */
+    size = GST_VIDEO_INFO_SIZE (&info);
 
-        gst_buffer_pool_config_add_option(config, GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT);
-        gst_buffer_pool_config_set_video_alignment(config, &align);
-
-        /* Size has to account for the padding introduced by the alignment. */
-        gst_video_info_align(&info, &align);
-        size = MAX(size, GST_VIDEO_INFO_SIZE(&info));
+    config = gst_buffer_pool_get_config (pool);
+    gst_buffer_pool_config_set_params (config, outcaps, size, min, max);
+    gst_buffer_pool_config_add_option (config,
+        GST_BUFFER_POOL_OPTION_VIDEO_META);
+    if (!gst_buffer_pool_set_config (pool, config)) {
+        GST_WARNING_OBJECT (trans, "failed to configure dma-buf pool; "
+                                   "falling back to non-zero-copy output path");
+        gst_object_unref (pool);
+        return GST_BASE_TRANSFORM_CLASS (gst_rga_convert_parent_class)
+            ->decide_allocation (trans, query);
     }
+
+    /* Re-read the (possibly grown) size the pool settled on. */
+    config = gst_buffer_pool_get_config (pool);
+    gst_buffer_pool_config_get_params (config, NULL, &size, NULL, NULL);
+    gst_structure_free (config);
+
+    if (gst_query_get_n_allocation_pools (query) > 0)
+        gst_query_set_nth_allocation_pool (query, 0, pool, size, min, max);
     else
-    {
-        GST_WARNING_OBJECT(trans, "pool does not support stride alignment; "
-                                  "unaligned output sizes may be rejected by RGA");
-    }
+        gst_query_add_allocation_pool (query, pool, size, min, max);
 
-    gst_buffer_pool_config_set_params(config, outcaps, size, min, max);
-    gst_buffer_pool_set_config(pool, config);
+    if (!gst_query_find_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL))
+        gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
 
-    gst_query_set_nth_allocation_pool(query, 0, pool, size, min, max);
-    gst_object_unref(pool);
+    GST_DEBUG_OBJECT (trans, "using dma-buf output pool (size %u, min %u)",
+        size, min);
 
+    gst_object_unref (pool);
     return TRUE;
 }
 
