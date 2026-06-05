@@ -158,6 +158,9 @@ static GstCaps *gst_rga_convert_fixate_caps(
 static gboolean gst_rga_convert_decide_allocation(GstBaseTransform *trans,
                                                   GstQuery *query);
 
+static gboolean gst_rga_convert_propose_allocation(GstBaseTransform *trans,
+                                                   GstQuery *decide_query, GstQuery *query);
+
 static gboolean gst_rga_convert_set_info(GstVideoFilter *filter,
                                          GstCaps *incaps, GstVideoInfo *in_info, GstCaps *outcaps, GstVideoInfo *out_info);
 
@@ -237,6 +240,7 @@ gst_rga_convert_class_init(GstRgaConvertClass *klass)
     base_transform_class->transform_caps     = GST_DEBUG_FUNCPTR(gst_rga_convert_transform_caps);
     base_transform_class->fixate_caps        = GST_DEBUG_FUNCPTR(gst_rga_convert_fixate_caps);
     base_transform_class->decide_allocation  = GST_DEBUG_FUNCPTR(gst_rga_convert_decide_allocation);
+    base_transform_class->propose_allocation = GST_DEBUG_FUNCPTR(gst_rga_convert_propose_allocation);
 
     video_filter_class->set_info        = GST_DEBUG_FUNCPTR(gst_rga_convert_set_info);
     video_filter_class->transform_frame = GST_DEBUG_FUNCPTR(gst_rga_convert_transform_frame);
@@ -679,6 +683,25 @@ gst_rga_convert_decide_allocation (GstBaseTransform *trans, GstQuery *query)
         size, min);
 
     gst_object_unref (pool);
+    return TRUE;
+}
+
+/*
+ * Tell upstream we can attach/accept a GstVideoMeta. A dma-buf producing source
+ * (e.g. a camera in io-mode=dmabuf) then supplies stride metadata that
+ * gst_rga_frame_import() uses to import the buffer zero-copy via importbuffer_fd.
+ */
+static gboolean
+gst_rga_convert_propose_allocation (GstBaseTransform *trans,
+                                    GstQuery *decide_query, GstQuery *query)
+{
+    if (!GST_BASE_TRANSFORM_CLASS (gst_rga_convert_parent_class)
+             ->propose_allocation (trans, decide_query, query))
+        return FALSE;
+
+    if (!gst_query_find_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL))
+        gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
+
     return TRUE;
 }
 
