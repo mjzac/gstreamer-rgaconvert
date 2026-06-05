@@ -3,7 +3,9 @@ lib_args = common_args + []
 # sources used to compile this plug-in
 plugin_sources = [
   'gstrgaconvert.c',
-  'gstrgaconvert.h'
+  'gstrgaconvert.h',
+  'dmaheap.c',
+  'dmaheap.h'
 ]
 
 shlib = shared_library('gstrgaconvert',
