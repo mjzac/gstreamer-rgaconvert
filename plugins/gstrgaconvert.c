@@ -455,6 +455,7 @@ gst_rga_frame_import(GstRgaFrame *rga_frame, GstVideoFrame *frame, GstMapFlags m
     if (fd > 0)
     {
         rga_frame->handle = importbuffer_fd(fd, &param);
+        GST_LOG("rga import: dma-buf fd %d (zero-copy)", fd);
     }
     else
     {
@@ -462,6 +463,7 @@ gst_rga_frame_import(GstRgaFrame *rga_frame, GstVideoFrame *frame, GstMapFlags m
             return FALSE;
         rga_frame->mapped = TRUE;
         rga_frame->handle = importbuffer_virtualaddr(rga_frame->map_info.data, &param);
+        GST_LOG("rga import: CPU virtual address (no dma-buf, slow path)");
     }
 
     if (rga_frame->handle == 0)
