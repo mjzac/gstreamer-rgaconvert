@@ -16,8 +16,11 @@ main (int argc, char **argv)
         return 1;
     }
 
+    /* width 1281 -> byte stride 1281*4 = 5124, which the pool must round up
+     * to the next multiple of 16 (5136). 1281 is deliberately NOT 16-aligned
+     * so this exercises the pool's stride-alignment path. */
     GstCaps *caps =
-        gst_caps_from_string ("video/x-raw,format=BGRx,width=1280,height=720");
+        gst_caps_from_string ("video/x-raw,format=BGRx,width=1281,height=720");
     GstVideoInfo info;
     gst_video_info_from_caps (&info, caps);
 
@@ -47,8 +50,15 @@ main (int argc, char **argv)
         fprintf (stderr, "FAIL: buffer memory is not dma-buf\n");
         return 1;
     }
-    if (gst_buffer_get_video_meta (buf) == NULL) {
+    GstVideoMeta *vmeta = gst_buffer_get_video_meta (buf);
+    if (vmeta == NULL) {
         fprintf (stderr, "FAIL: buffer has no GstVideoMeta\n");
+        return 1;
+    }
+    /* 1281 * 4 = 5124 bytes, rounded up to a multiple of 16 = 5136. */
+    if (vmeta->stride[0] != 5136) {
+        fprintf (stderr, "FAIL: stride[0]=%d, expected 5136 (16-aligned)\n",
+            vmeta->stride[0]);
         return 1;
     }
 
