@@ -38,6 +38,9 @@ struct _GstRgaConvert
 {
   GstVideoFilter base_rgaconvert;
 
+  /* properties */
+  gint rotation;     /* GstRgaConvertRotation: 0 / 90 / 180 / 270 degrees */
+  gint flip;         /* GstRgaConvertFlip: none / horizontal / vertical / both */
 };
 
 struct _GstRgaConvertClass

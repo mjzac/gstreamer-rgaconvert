@@ -19,14 +19,28 @@
 /**
  * SECTION:element-gstrgaconvert
  *
- * The rgaconvert element does FIXME stuff.
+ * The rgaconvert element uses the Rockchip RGA 2D hardware accelerator (via the
+ * librga im2d API) to scale, colour-convert, rotate and flip raw video frames.
+ * Scaling and format conversion are driven by caps negotiation; rotation and
+ * mirroring are controlled through the #GstRgaConvert:rotation and
+ * #GstRgaConvert:flip properties.
  *
  * <refsect2>
- * <title>Example launch line</title>
+ * <title>Example launch lines</title>
  * |[
  * gst-launch-1.0 -v fakesrc ! video/x-raw,format=NV12,width=1920,height=1080 ! rgaconvert ! video/x-raw,format=RGBA,width=640,height=480 ! fakesink
  * ]|
  * convert 1920x1080 ---> 640x480 and NV12 ---> RGBA .
+ * |[
+ * gst-launch-1.0 -v videotestsrc ! video/x-raw,format=NV12,width=1280,height=720 ! rgaconvert rotation=clockwise-90 ! autovideosink
+ * ]|
+ * rotate the stream 90 degrees clockwise (the output size 720x1280 is chosen
+ * automatically; rotation=counterclockwise-90 and rotation=180 are also
+ * supported).
+ * |[
+ * gst-launch-1.0 -v videotestsrc ! rgaconvert flip=horizontal ! autovideosink
+ * ]|
+ * mirror the stream horizontally.
  * </refsect2>
  */
 
@@ -35,10 +49,11 @@
 #endif
 
 #include "gstrgaconvert.h"
-#include "rga/RgaApi.h"
+#include "rga/im2d.h"
 #include <gst/allocators/gstdmabuf.h>
 #include <gst/gst.h>
 #include <gst/video/gstvideofilter.h>
+#include <gst/video/gstvideopool.h>
 #include <gst/video/video.h>
 
 GST_DEBUG_CATEGORY_STATIC(gst_rga_convert_debug_category);
@@ -48,14 +63,99 @@ GST_DEBUG_CATEGORY_STATIC(gst_rga_convert_debug_category);
     case a:                   \
         return b
 
+#define DEFAULT_ROTATION GST_RGA_CONVERT_ROTATE_0
+#define DEFAULT_FLIP     GST_RGA_CONVERT_FLIP_NONE
+
+enum
+{
+    PROP_0,
+    PROP_ROTATION,
+    PROP_FLIP,
+};
+
+/*
+ * Rotation property values. The numeric values are clockwise degrees so that
+ * e.g. "rotation=90" keeps working, while the GEnumValue nicks make the
+ * direction explicit. RGA's IM_HAL_TRANSFORM_ROT_* follows the Android HAL
+ * convention where ROT_90 is a clockwise rotation, so a 90 degree
+ * counter-clockwise rotation is ROT_270.
+ */
+typedef enum
+{
+    GST_RGA_CONVERT_ROTATE_0   = 0,
+    GST_RGA_CONVERT_ROTATE_90  = 90,  /* 90 degrees clockwise */
+    GST_RGA_CONVERT_ROTATE_180 = 180,
+    GST_RGA_CONVERT_ROTATE_270 = 270, /* 90 degrees counter-clockwise */
+} GstRgaConvertRotation;
+
+/* flip/mirror property values */
+typedef enum
+{
+    GST_RGA_CONVERT_FLIP_NONE       = 0,
+    GST_RGA_CONVERT_FLIP_HORIZONTAL,
+    GST_RGA_CONVERT_FLIP_VERTICAL,
+    GST_RGA_CONVERT_FLIP_BOTH,
+} GstRgaConvertFlip;
+
+#define GST_TYPE_RGA_CONVERT_ROTATION (gst_rga_convert_rotation_get_type())
+static GType
+gst_rga_convert_rotation_get_type(void)
+{
+    static GType type = 0;
+    static const GEnumValue values[] = {
+        {GST_RGA_CONVERT_ROTATE_0, "No rotation", "none"},
+        {GST_RGA_CONVERT_ROTATE_90, "Rotate 90 degrees clockwise", "clockwise-90"},
+        {GST_RGA_CONVERT_ROTATE_180, "Rotate 180 degrees", "180"},
+        {GST_RGA_CONVERT_ROTATE_270, "Rotate 90 degrees counter-clockwise", "counterclockwise-90"},
+        {0, NULL, NULL},
+    };
+
+    if (g_once_init_enter(&type))
+    {
+        GType _type = g_enum_register_static("GstRgaConvertRotation", values);
+        g_once_init_leave(&type, _type);
+    }
+    return type;
+}
+
+#define GST_TYPE_RGA_CONVERT_FLIP (gst_rga_convert_flip_get_type())
+static GType
+gst_rga_convert_flip_get_type(void)
+{
+    static GType type = 0;
+    static const GEnumValue values[] = {
+        {GST_RGA_CONVERT_FLIP_NONE, "No flip", "none"},
+        {GST_RGA_CONVERT_FLIP_HORIZONTAL, "Flip horizontally (mirror)", "horizontal"},
+        {GST_RGA_CONVERT_FLIP_VERTICAL, "Flip vertically", "vertical"},
+        {GST_RGA_CONVERT_FLIP_BOTH, "Flip both horizontally and vertically", "both"},
+        {0, NULL, NULL},
+    };
+
+    if (g_once_init_enter(&type))
+    {
+        GType _type = g_enum_register_static("GstRgaConvertFlip", values);
+        g_once_init_leave(&type, _type);
+    }
+    return type;
+}
+
 /* prototypes */
 
-static gboolean gst_rga_convert_start(GstBaseTransform *trans);
-static gboolean gst_rga_convert_stop(GstBaseTransform *trans);
+static void gst_rga_convert_set_property(GObject *object, guint prop_id,
+                                         const GValue *value, GParamSpec *pspec);
+static void gst_rga_convert_get_property(GObject *object, guint prop_id,
+                                         GValue *value, GParamSpec *pspec);
 
 static GstCaps *gst_rga_convert_transform_caps(
     GstBaseTransform *trans, GstPadDirection direction, GstCaps *caps,
     GstCaps *filter);
+
+static GstCaps *gst_rga_convert_fixate_caps(
+    GstBaseTransform *trans, GstPadDirection direction, GstCaps *caps,
+    GstCaps *othercaps);
+
+static gboolean gst_rga_convert_decide_allocation(GstBaseTransform *trans,
+                                                  GstQuery *query);
 
 static gboolean gst_rga_convert_set_info(GstVideoFilter *filter,
                                          GstCaps *incaps, GstVideoInfo *in_info, GstCaps *outcaps, GstVideoInfo *out_info);
@@ -106,17 +206,118 @@ gst_rga_convert_class_init(GstRgaConvertClass *klass)
                                                             gst_caps_from_string(VIDEO_SINK_CAPS)));
 
     gst_element_class_set_static_metadata(GST_ELEMENT_CLASS(klass),
-                                          "Rockchip rga hardware convert", "Generic", "change video streams size and color via Rockchip rga",
+                                          "Rockchip rga hardware convert", "Filter/Converter/Video/Scaler",
+                                          "Scale, color-convert, rotate and flip video streams via the Rockchip RGA 2D hardware (im2d API)",
                                           "http://github.com/higithubhi/gstreamer-rgaconvert");
 
-    base_transform_class->passthrough_on_same_caps = TRUE;
+    gobject_class->set_property = gst_rga_convert_set_property;
+    gobject_class->get_property = gst_rga_convert_get_property;
 
-    base_transform_class->transform_caps = GST_DEBUG_FUNCPTR(gst_rga_convert_transform_caps);
+    g_object_class_install_property(
+        gobject_class, PROP_ROTATION,
+        g_param_spec_enum("rotation", "Rotation",
+                          "Rotation to apply to the image (clockwise-90, "
+                          "counterclockwise-90 or 180 degrees)",
+                          GST_TYPE_RGA_CONVERT_ROTATION, DEFAULT_ROTATION,
+                          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
-    base_transform_class->start         = GST_DEBUG_FUNCPTR(gst_rga_convert_start);
-    base_transform_class->stop          = GST_DEBUG_FUNCPTR(gst_rga_convert_stop);
+    g_object_class_install_property(
+        gobject_class, PROP_FLIP,
+        g_param_spec_enum("flip", "Flip",
+                          "Mirror/flip to apply to the image",
+                          GST_TYPE_RGA_CONVERT_FLIP, DEFAULT_FLIP,
+                          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+    /* A rotation/flip request must run through the hardware even when the
+     * input and output caps are identical, so the same-caps passthrough
+     * optimisation cannot be used. */
+    base_transform_class->passthrough_on_same_caps = FALSE;
+
+    base_transform_class->transform_caps     = GST_DEBUG_FUNCPTR(gst_rga_convert_transform_caps);
+    base_transform_class->fixate_caps        = GST_DEBUG_FUNCPTR(gst_rga_convert_fixate_caps);
+    base_transform_class->decide_allocation  = GST_DEBUG_FUNCPTR(gst_rga_convert_decide_allocation);
+
     video_filter_class->set_info        = GST_DEBUG_FUNCPTR(gst_rga_convert_set_info);
     video_filter_class->transform_frame = GST_DEBUG_FUNCPTR(gst_rga_convert_transform_frame);
+}
+
+static void
+gst_rga_convert_set_property(GObject *object, guint prop_id,
+                             const GValue *value, GParamSpec *pspec)
+{
+    GstRgaConvert *rgaconvert = GST_RGA_CONVERT(object);
+
+    switch (prop_id)
+    {
+    case PROP_ROTATION:
+        rgaconvert->rotation = g_value_get_enum(value);
+        break;
+    case PROP_FLIP:
+        rgaconvert->flip = g_value_get_enum(value);
+        break;
+    default:
+        G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+        break;
+    }
+}
+
+static void
+gst_rga_convert_get_property(GObject *object, guint prop_id,
+                             GValue *value, GParamSpec *pspec)
+{
+    GstRgaConvert *rgaconvert = GST_RGA_CONVERT(object);
+
+    switch (prop_id)
+    {
+    case PROP_ROTATION:
+        g_value_set_enum(value, rgaconvert->rotation);
+        break;
+    case PROP_FLIP:
+        g_value_set_enum(value, rgaconvert->flip);
+        break;
+    default:
+        G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+        break;
+    }
+}
+
+/* Translate the rotation/flip properties into RGA im2d usage flags. */
+static int
+gst_rga_convert_build_usage(GstRgaConvert *rgaconvert)
+{
+    int usage = IM_SYNC;
+
+    switch (rgaconvert->rotation)
+    {
+    case GST_RGA_CONVERT_ROTATE_90:
+        usage |= IM_HAL_TRANSFORM_ROT_90;
+        break;
+    case GST_RGA_CONVERT_ROTATE_180:
+        usage |= IM_HAL_TRANSFORM_ROT_180;
+        break;
+    case GST_RGA_CONVERT_ROTATE_270:
+        usage |= IM_HAL_TRANSFORM_ROT_270;
+        break;
+    default:
+        break;
+    }
+
+    switch (rgaconvert->flip)
+    {
+    case GST_RGA_CONVERT_FLIP_HORIZONTAL:
+        usage |= IM_HAL_TRANSFORM_FLIP_H;
+        break;
+    case GST_RGA_CONVERT_FLIP_VERTICAL:
+        usage |= IM_HAL_TRANSFORM_FLIP_V;
+        break;
+    case GST_RGA_CONVERT_FLIP_BOTH:
+        usage |= IM_HAL_TRANSFORM_FLIP_H_V;
+        break;
+    default:
+        break;
+    }
+
+    return usage;
 }
 
 static RgaSURF_FORMAT gst_gst_format_to_rga_format(GstVideoFormat format)
@@ -147,28 +348,35 @@ static RgaSURF_FORMAT gst_gst_format_to_rga_format(GstVideoFormat format)
     }
 }
 
-static gboolean gst_set_rga_info(
-    rga_info_t *info, RgaSURF_FORMAT format, guint width, guint height,
-    guint hstride, guint vstride)
+/* A GstVideoFrame imported into the RGA driver as an im2d buffer. */
+typedef struct
 {
-    gint pixel_stride;
+    rga_buffer_handle_t handle;   /* RGA buffer handle, 0 when not imported */
+    rga_buffer_t        buffer;   /* im2d buffer descriptor */
+    GstMapInfo          map_info; /* CPU mapping, valid when 'mapped' is TRUE */
+    gboolean            mapped;
+} GstRgaFrame;
 
+/*
+ * Bytes per pixel for packed/RGB formats, or 1 for YUV formats whose luma
+ * stride is already expressed in samples. Returns 0 for unsupported formats.
+ */
+static gint
+gst_rga_convert_pixel_stride(RgaSURF_FORMAT format)
+{
     switch (format)
     {
     case RK_FORMAT_RGBX_8888:
     case RK_FORMAT_BGRX_8888:
     case RK_FORMAT_RGBA_8888:
     case RK_FORMAT_BGRA_8888:
-        pixel_stride = 4;
-        break;
+        return 4;
     case RK_FORMAT_RGB_888:
     case RK_FORMAT_BGR_888:
-        pixel_stride = 3;
-        break;
+        return 3;
     case RK_FORMAT_RGBA_5551:
     case RK_FORMAT_RGB_565:
-        pixel_stride = 2;
-        break;
+        return 2;
     case RK_FORMAT_YCbCr_420_SP_10B:
     case RK_FORMAT_YCbCr_422_SP:
     case RK_FORMAT_YCrCb_422_SP:
@@ -178,64 +386,95 @@ static gboolean gst_set_rga_info(
     case RK_FORMAT_YCrCb_420_SP:
     case RK_FORMAT_YCbCr_420_P:
     case RK_FORMAT_YCrCb_420_P:
-        pixel_stride = 1;
-
-        /* RGA requires yuv image rect align to 2 */
-        width &= ~1;
-        height &= ~1;
-        break;
+        return 1;
     default:
-        return FALSE;
+        return 0;
     }
+}
 
-    if (info->fd < 0 && !info->virAddr)
+/*
+ * Import a GstVideoFrame into the RGA driver, preferring a zero-copy dma-buf
+ * import and falling back to a CPU mapping + virtual-address import. On success
+ * 'rga_frame' must later be passed to gst_rga_frame_release().
+ */
+static gboolean
+gst_rga_frame_import(GstRgaFrame *rga_frame, GstVideoFrame *frame, GstMapFlags map_flags)
+{
+    RgaSURF_FORMAT format = gst_gst_format_to_rga_format(GST_VIDEO_FRAME_FORMAT(frame));
+    gint pixel_stride     = gst_rga_convert_pixel_stride(format);
+
+    if (pixel_stride == 0)
         return FALSE;
 
+    gint width   = GST_VIDEO_FRAME_WIDTH(frame);
+    gint height  = GST_VIDEO_FRAME_HEIGHT(frame);
+    gint hstride = GST_VIDEO_FRAME_PLANE_STRIDE(frame, 0);
+    gint vstride = GST_VIDEO_FRAME_N_PLANES(frame) == 1
+                       ? GST_VIDEO_INFO_HEIGHT(&frame->info)
+                       : GST_VIDEO_INFO_PLANE_OFFSET(&frame->info, 1) / hstride;
+
+    /* im2d expresses strides in pixels; convert the luma byte stride for
+     * packed/RGB formats. */
     if (hstride / pixel_stride >= width)
         hstride /= pixel_stride;
 
-    info->mmuFlag = 1;
-    rga_set_rect(&info->rect, 0, 0, width, height, hstride, vstride, format);
-    return TRUE;
-}
-
-static gboolean
-gst_rga_info_from_video_frame(rga_info_t *info, GstVideoFrame *frame, GstMapInfo *mapInfo, GstMapFlags mapFlag)
-{
-    RgaSURF_FORMAT rga_format =
-        gst_gst_format_to_rga_format(GST_VIDEO_FRAME_FORMAT(frame));
-
-    guint width   = GST_VIDEO_FRAME_WIDTH(frame);
-    guint height  = GST_VIDEO_FRAME_HEIGHT(frame);
-    guint hstride = GST_VIDEO_FRAME_PLANE_STRIDE(frame, 0);
-    guint vstride = GST_VIDEO_FRAME_N_PLANES(frame) == 1
-                        ? GST_VIDEO_INFO_HEIGHT(&frame->info)
-                        : GST_VIDEO_INFO_PLANE_OFFSET(&frame->info, 1) / hstride;
-
-    if (!gst_set_rga_info(info, rga_format, width, height, hstride, vstride))
+    /* RGA requires YUV image rectangles to be aligned to 2 pixels. */
+    if (pixel_stride == 1)
     {
-        return FALSE;
+        width  &= ~1;
+        height &= ~1;
     }
-    GstBuffer *inbuf = frame->buffer;
-    if (gst_buffer_n_memory(inbuf) == 1)
+
+    GstBuffer *buf = frame->buffer;
+    gint       fd  = -1;
+
+    if (gst_buffer_n_memory(buf) == 1)
     {
-        GstMemory *mem = gst_buffer_peek_memory(inbuf, 0);
+        GstMemory *mem = gst_buffer_peek_memory(buf, 0);
         gsize      offset;
 
         if (gst_is_dmabuf_memory(mem))
         {
             gst_memory_get_sizes(mem, &offset, NULL);
             if (!offset)
-                info->fd = gst_dmabuf_memory_get_fd(mem);
+                fd = gst_dmabuf_memory_get_fd(mem);
         }
     }
 
-    if (info->fd <= 0)
+    im_handle_param_t param = {
+        .width  = (uint32_t)hstride,
+        .height = (uint32_t)vstride,
+        .format = (uint32_t)format,
+    };
+
+    if (fd > 0)
     {
-        gst_buffer_map(inbuf, mapInfo, mapFlag);
-        info->virAddr = mapInfo->data;
+        rga_frame->handle = importbuffer_fd(fd, &param);
     }
+    else
+    {
+        if (!gst_buffer_map(buf, &rga_frame->map_info, map_flags))
+            return FALSE;
+        rga_frame->mapped = TRUE;
+        rga_frame->handle = importbuffer_virtualaddr(rga_frame->map_info.data, &param);
+    }
+
+    if (rga_frame->handle == 0)
+        return FALSE;
+
+    rga_frame->buffer =
+        wrapbuffer_handle(rga_frame->handle, width, height, format, hstride, vstride);
+
     return TRUE;
+}
+
+static void
+gst_rga_frame_release(GstRgaFrame *rga_frame, GstVideoFrame *frame)
+{
+    if (rga_frame->handle != 0)
+        releasebuffer_handle(rga_frame->handle);
+    if (rga_frame->mapped)
+        gst_buffer_unmap(frame->buffer, &rga_frame->map_info);
 }
 
 static GstCaps *gst_rga_convert_transform_caps(
@@ -270,29 +509,31 @@ static GstCaps *gst_rga_convert_transform_caps(
 
         if (direction == GST_PAD_SRC)
         {
-            //rga输出最大4096
+            /* caps are on the src (output) pad; describe the sink (input)
+             * pad here. RGA input max is 8192. */
             gst_structure_set(structure,
                               "width",
                               GST_TYPE_INT_RANGE,
                               1,
-                              4096,
+                              8192,
                               "height",
                               GST_TYPE_INT_RANGE,
                               1,
-                              4096,
+                              8192,
                               NULL);
         } else
         {
-            //输入最大8192
+            /* caps are on the sink (input) pad; describe the src (output)
+             * pad here. RGA output max is 4096. */
             gst_structure_set(structure,
                               "width",
                               GST_TYPE_INT_RANGE,
                               1,
-                              8192,
+                              4096,
                               "height",
                               GST_TYPE_INT_RANGE,
                               1,
-                              8192,
+                              4096,
                               NULL);
         }
         if (!gst_caps_features_is_any(features))
@@ -317,29 +558,125 @@ static GstCaps *gst_rga_convert_transform_caps(
     return ret;
 }
 
+/*
+ * Choose a default output resolution when downstream leaves it open. For a
+ * plain converter that is just the input size, but a 90/270 degree rotation
+ * swaps width and height so the default output must be swapped too (e.g.
+ * 1920x1080 rotated 90 defaults to 1080x1920). An explicit downstream caps
+ * filter still wins via gst_structure_fixate_field_nearest_int().
+ */
+static GstCaps *
+gst_rga_convert_fixate_caps(GstBaseTransform *trans, GstPadDirection direction,
+                            GstCaps *caps, GstCaps *othercaps)
+{
+    GstRgaConvert *rgaconvert = GST_RGA_CONVERT(trans);
+
+    othercaps = gst_caps_make_writable(othercaps);
+
+    /* Only steer the default size when transforming a fixed input (sink)
+     * towards the output (src). */
+    if (direction == GST_PAD_SINK)
+    {
+        GstStructure *ins = gst_caps_get_structure(caps, 0);
+        gint          in_w = 0, in_h = 0;
+
+        if (gst_structure_get_int(ins, "width", &in_w)
+            && gst_structure_get_int(ins, "height", &in_h))
+        {
+            gint target_w = in_w;
+            gint target_h = in_h;
+
+            if (rgaconvert->rotation == GST_RGA_CONVERT_ROTATE_90
+                || rgaconvert->rotation == GST_RGA_CONVERT_ROTATE_270)
+            {
+                target_w = in_h;
+                target_h = in_w;
+            }
+
+            GstStructure *outs = gst_caps_get_structure(othercaps, 0);
+            gst_structure_fixate_field_nearest_int(outs, "width", target_w);
+            gst_structure_fixate_field_nearest_int(outs, "height", target_h);
+        }
+    }
+
+    /* Fixate any remaining fields (format, framerate, ...) to defaults. */
+    othercaps = gst_caps_fixate(othercaps);
+
+    GST_DEBUG_OBJECT(trans, "fixated to: %" GST_PTR_FORMAT, othercaps);
+
+    return othercaps;
+}
+
+/*
+ * Configure the output buffer pool so that buffers are allocated with
+ * 16-pixel-aligned plane strides. RGA requires the width stride of (planar)
+ * YUV buffers to be 16-aligned, which an arbitrary output size such as the
+ * 1080-wide result of rotating 1080p by 90 degrees would otherwise violate.
+ */
+static gboolean
+gst_rga_convert_decide_allocation(GstBaseTransform *trans, GstQuery *query)
+{
+    GstCaps          *outcaps = NULL;
+    GstBufferPool    *pool    = NULL;
+    guint             size, min, max;
+    GstStructure     *config;
+    GstVideoInfo      info;
+    GstVideoAlignment align;
+    gint              i;
+
+    if (!GST_BASE_TRANSFORM_CLASS(gst_rga_convert_parent_class)->decide_allocation(trans, query))
+        return FALSE;
+
+    if (gst_query_get_n_allocation_pools(query) == 0)
+        return TRUE;
+
+    gst_query_parse_nth_allocation_pool(query, 0, &pool, &size, &min, &max);
+    if (pool == NULL)
+        return TRUE;
+
+    gst_query_parse_allocation(query, &outcaps, NULL);
+    if (outcaps == NULL || !gst_video_info_from_caps(&info, outcaps))
+    {
+        gst_object_unref(pool);
+        return TRUE;
+    }
+
+    config = gst_buffer_pool_get_config(pool);
+    gst_buffer_pool_config_add_option(config, GST_BUFFER_POOL_OPTION_VIDEO_META);
+
+    if (gst_buffer_pool_has_option(pool, GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT))
+    {
+        gst_video_alignment_reset(&align);
+        for (i = 0; i < GST_VIDEO_MAX_PLANES; i++)
+            align.stride_align[i] = 15; /* round strides up to a multiple of 16 */
+
+        gst_buffer_pool_config_add_option(config, GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT);
+        gst_buffer_pool_config_set_video_alignment(config, &align);
+
+        /* Size has to account for the padding introduced by the alignment. */
+        gst_video_info_align(&info, &align);
+        size = MAX(size, GST_VIDEO_INFO_SIZE(&info));
+    }
+    else
+    {
+        GST_WARNING_OBJECT(trans, "pool does not support stride alignment; "
+                                  "unaligned output sizes may be rejected by RGA");
+    }
+
+    gst_buffer_pool_config_set_params(config, outcaps, size, min, max);
+    gst_buffer_pool_set_config(pool, config);
+
+    gst_query_set_nth_allocation_pool(query, 0, pool, size, min, max);
+    gst_object_unref(pool);
+
+    return TRUE;
+}
+
 static void
 gst_rga_convert_init(GstRgaConvert *rgaconvert)
 {
-}
-
-static gboolean
-gst_rga_convert_start(GstBaseTransform *trans)
-{
-    GstRgaConvert *rgaconvert = GST_RGA_CONVERT(trans);
-
-    GST_DEBUG_OBJECT(rgaconvert, "start");
-    c_RkRgaInit();
-    return TRUE;
-}
-
-static gboolean
-gst_rga_convert_stop(GstBaseTransform *trans)
-{
-    GstRgaConvert *rgaconvert = GST_RGA_CONVERT(trans);
-
-    GST_DEBUG_OBJECT(rgaconvert, "stop");
-    c_RkRgaDeInit();
-    return TRUE;
+    rgaconvert->rotation = DEFAULT_ROTATION;
+    rgaconvert->flip     = DEFAULT_FLIP;
 }
 
 static gboolean
@@ -353,7 +690,7 @@ gst_rga_convert_set_info(GstVideoFilter *filter, GstCaps *incaps,
     GstVideoFormat out_format = GST_VIDEO_INFO_FORMAT(out_info);
 
     if (gst_gst_format_to_rga_format(in_format) == RK_FORMAT_UNKNOWN
-        ||gst_gst_format_to_rga_format(in_format) == RK_FORMAT_UNKNOWN)
+        || gst_gst_format_to_rga_format(out_format) == RK_FORMAT_UNKNOWN)
     {
         GST_INFO_OBJECT(filter, "don't support format. in format=%d,out format=%d", in_format, out_format);
         return FALSE;
@@ -367,47 +704,54 @@ gst_rga_convert_transform_frame(GstVideoFilter *filter, GstVideoFrame *inframe,
                                 GstVideoFrame *outframe)
 {
     GstRgaConvert *rgaconvert = GST_RGA_CONVERT(filter);
+    GstRgaFrame    src         = {0,};
+    GstRgaFrame    dst         = {0,};
+    GstFlowReturn  flow        = GST_FLOW_OK;
+    im_rect        empty_rect  = {0,};
+    rga_buffer_t   empty_pat   = {0,};
+    int            usage;
+    IM_STATUS      status;
 
     GST_DEBUG_OBJECT(rgaconvert, "transform_frame");
 
-    GstMapInfo inMapinfo = {
-        0,
-    };
-    GstMapInfo outMapinfo = {
-        0,
-    };
-
-    rga_info_t src_info = {
-        0,
-    };
-    rga_info_t dst_info = {
-        0,
-    };
-
-    if (!gst_rga_info_from_video_frame(
-            &src_info, inframe, &inMapinfo, GST_MAP_READ))
-        return GST_FLOW_ERROR;
-
-    if (!gst_rga_info_from_video_frame(
-            &dst_info, outframe, &outMapinfo, GST_MAP_WRITE))
-        return GST_FLOW_ERROR;
-
-    gboolean ret = TRUE;
-    if (c_RkRgaBlit(&src_info, &dst_info, NULL) < 0)
+    if (!gst_rga_frame_import(&src, inframe, GST_MAP_READ))
     {
-        GST_WARNING_OBJECT(filter, "failed to blit");
-        ret = FALSE;
+        GST_WARNING_OBJECT(filter, "failed to import source frame into rga");
+        flow = GST_FLOW_ERROR;
+        goto out;
     }
 
-    gst_buffer_unmap(inframe->buffer, &inMapinfo);
-    gst_buffer_unmap(outframe->buffer, &outMapinfo);
-
-    if (!ret)
+    if (!gst_rga_frame_import(&dst, outframe, GST_MAP_WRITE))
     {
-        return GST_FLOW_ERROR;
+        GST_WARNING_OBJECT(filter, "failed to import destination frame into rga");
+        flow = GST_FLOW_ERROR;
+        goto out;
     }
 
-    return GST_FLOW_OK;
+    usage = gst_rga_convert_build_usage(rgaconvert);
+
+    /* Validate the requested operation against the RGA hardware limits. */
+    status = imcheck(src.buffer, dst.buffer, empty_rect, empty_rect, usage);
+    if (status != IM_STATUS_NOERROR)
+    {
+        GST_WARNING_OBJECT(filter, "rga check failed: %s", imStrError(status));
+        flow = GST_FLOW_ERROR;
+        goto out;
+    }
+
+    /* Scale + colour-convert (+ optional rotate/flip) in a single blit. */
+    status = improcess(src.buffer, dst.buffer, empty_pat,
+                       empty_rect, empty_rect, empty_rect, usage);
+    if (status != IM_STATUS_SUCCESS)
+    {
+        GST_WARNING_OBJECT(filter, "rga process failed: %s", imStrError(status));
+        flow = GST_FLOW_ERROR;
+    }
+
+out:
+    gst_rga_frame_release(&dst, outframe);
+    gst_rga_frame_release(&src, inframe);
+    return flow;
 }
 
 static gboolean
