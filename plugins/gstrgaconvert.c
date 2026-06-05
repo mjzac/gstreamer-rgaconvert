@@ -609,10 +609,16 @@ gst_rga_convert_fixate_caps(GstBaseTransform *trans, GstPadDirection direction,
 }
 
 /*
- * Configure the output buffer pool so that buffers are allocated with
- * 16-pixel-aligned plane strides. RGA requires the width stride of (planar)
- * YUV buffers to be 16-aligned, which an arbitrary output size such as the
- * 1080-wide result of rotating 1080p by 90 degrees would otherwise violate.
+ * Install a self-allocated, dma-heap-backed dma-buf pool as the output pool so
+ * RGA writes converted frames directly into dma-buf (zero-copy towards a
+ * dma-buf-aware or CPU-mapping consumer). The pool also applies the 16-pixel
+ * stride alignment RGA requires. When no dma-heap is available (or the pool
+ * fails to configure) we chain up to the parent, which falls back to a
+ * CPU-mapped output pool.
+ *
+ * Note: on the success path we deliberately do NOT chain up to the parent.
+ * This element must own a dma-buf output pool; chaining up would install/keep
+ * a CPU pool, and downstream-offered allocators are intentionally ignored.
  */
 static gboolean
 gst_rga_convert_decide_allocation (GstBaseTransform *trans, GstQuery *query)
