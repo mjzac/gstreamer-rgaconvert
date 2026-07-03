@@ -14,6 +14,12 @@ This installs `libgstrgaconvert.so` into the system GStreamer plugin
 directory (`/usr/lib/<triplet>/gstreamer-1.0/`), so pipelines find the
 `rgaconvert` element without setting `GST_PLUGIN_PATH`. Verify with:
 
+**Build on the oldest distro you deploy to.** GStreamer refuses plugins
+compiled against a newer GStreamer than the runtime (a 1.24-built plugin
+is blacklisted on a 1.20 system; the reverse works fine). The package
+declares the compiled-against version as a dependency, so installing a
+too-new build fails at `apt install` time with a clear error.
+
 ```sh
 gst-inspect-1.0 rgaconvert
 ```

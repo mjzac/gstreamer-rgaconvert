@@ -59,6 +59,13 @@ install -m 644 "$SRC_DIR/LICENSE" "$STAGING/usr/share/doc/$PACKAGE/copyright"
 
 INSTALLED_SIZE=$(du -sk --exclude=DEBIAN "$STAGING" | cut -f1)
 
+# GST_PLUGIN_DEFINE stamps the compiled-against GStreamer version into the
+# plugin, and the runtime refuses plugins newer than itself (e.g. a 1.24-built
+# plugin on a 1.20 system is blacklisted). Declare that real requirement so apt
+# fails loudly at install time instead. Build the package on the oldest distro
+# you deploy to.
+GST_MIN=$(pkg-config --modversion gstreamer-1.0 | cut -d. -f1-2)
+
 install -d -m 755 "$STAGING/DEBIAN"
 cat > "$STAGING/DEBIAN/control" <<EOF
 Package: $PACKAGE
@@ -68,7 +75,7 @@ Priority: optional
 Architecture: $ARCH
 Maintainer: $MAINTAINER
 Installed-Size: $INSTALLED_SIZE
-Depends: librga2, libgstreamer1.0-0 (>= 1.16), libgstreamer-plugins-base1.0-0 (>= 1.16), libglib2.0-0 (>= 2.64), libc6
+Depends: librga2, libgstreamer1.0-0 (>= $GST_MIN), libgstreamer-plugins-base1.0-0 (>= $GST_MIN), libglib2.0-0 (>= 2.64), libc6
 Description: GStreamer plugin for Rockchip RGA video conversion
  Provides the rgaconvert element, which uses the Rockchip RGA 2D engine
  for hardware-accelerated video format conversion, scaling, rotation and
