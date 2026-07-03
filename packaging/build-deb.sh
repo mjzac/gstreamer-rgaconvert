@@ -24,11 +24,19 @@ ARCH=$(dpkg --print-architecture)
 TRIPLET=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
 MAINTAINER=${MAINTAINER:-"$(git -C "$SRC_DIR" config user.name 2>/dev/null || echo unknown) <$(git -C "$SRC_DIR" config user.email 2>/dev/null || echo unknown@localhost)>"}
 
+# Cap the glib API level so the binary stays loadable on older distros: with
+# glib >= 2.80 headers, G_DEFINE_TYPE otherwise expands to
+# g_once_init_enter_pointer/g_once_init_leave_pointer, symbols that don't exist
+# on pre-2.80 systems (e.g. Ubuntu 22.04) and get the plugin blacklisted at
+# dlopen. 2.64 is GStreamer 1.x's own glib floor.
+GLIB_CAP="GLIB_VERSION_2_64"
+
 # Fresh release build, separate from the dev build/ directory.
 meson setup "$BUILD_DIR" "$SRC_DIR" \
     --prefix=/usr \
     --libdir="lib/$TRIPLET" \
     --buildtype=release \
+    -Dc_args="-DGLIB_VERSION_MIN_REQUIRED=$GLIB_CAP -DGLIB_VERSION_MAX_ALLOWED=$GLIB_CAP" \
     --wipe
 meson compile -C "$BUILD_DIR"
 
@@ -60,7 +68,7 @@ Priority: optional
 Architecture: $ARCH
 Maintainer: $MAINTAINER
 Installed-Size: $INSTALLED_SIZE
-Depends: librga2, libgstreamer1.0-0 (>= 1.16), libgstreamer-plugins-base1.0-0 (>= 1.16), libc6
+Depends: librga2, libgstreamer1.0-0 (>= 1.16), libgstreamer-plugins-base1.0-0 (>= 1.16), libglib2.0-0 (>= 2.64), libc6
 Description: GStreamer plugin for Rockchip RGA video conversion
  Provides the rgaconvert element, which uses the Rockchip RGA 2D engine
  for hardware-accelerated video format conversion, scaling, rotation and
