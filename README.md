@@ -77,6 +77,20 @@ pipeline as root), otherwise frame import fails with
 
 ## Installation
 
+### Build dependencies
+
+```sh
+sudo apt install meson ninja-build build-essential pkg-config \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev librga-dev
+```
+
+`librga-dev` (and the `librga2` runtime library) is a Rockchip vendor
+package; on distros without it in the default archives it comes from the
+board vendor's BSP repository or from
+[airockchip/librga](https://github.com/airockchip/librga).
+
+### Debian package
+
 Build a Debian package and install it:
 
 ```sh
@@ -98,6 +112,8 @@ too-new build fails at `apt install` time with a clear error.
 gst-inspect-1.0 rgaconvert
 ```
 
+### Development build
+
 For development, build with meson and point GStreamer at the build dir
 instead:
 
@@ -105,3 +121,11 @@ instead:
 meson setup build && meson compile -C build
 GST_PLUGIN_PATH=$PWD/build/plugins gst-inspect-1.0 rgaconvert
 ```
+
+## Credits
+
+This plugin builds on the original `rgaconvert` element by
+[higithubhi](https://github.com/higithubhi/gstreamer-rgaconvert) — all
+credit for the original RGA converter goes to them. This fork adds
+dma-buf zero-copy input/output, the standard `video-direction` API,
+and Debian packaging.
