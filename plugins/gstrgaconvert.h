@@ -39,8 +39,12 @@ struct _GstRgaConvert
   GstVideoFilter base_rgaconvert;
 
   /* properties */
-  gint rotation;     /* GstRgaConvertRotation: 0 / 90 / 180 / 270 degrees */
-  gint flip;         /* GstRgaConvertFlip: none / horizontal / vertical / both */
+  GstVideoOrientationMethod video_direction; /* as set; may be AUTO */
+
+  /* orientation state, protected by GST_OBJECT_LOCK: the method that is
+   * actually applied (never AUTO) and the last image-orientation tag seen */
+  GstVideoOrientationMethod active_method;
+  GstVideoOrientationMethod tag_method;
 };
 
 struct _GstRgaConvertClass

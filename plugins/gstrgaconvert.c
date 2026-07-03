@@ -21,9 +21,10 @@
  *
  * The rgaconvert element uses the Rockchip RGA 2D hardware accelerator (via the
  * librga im2d API) to scale, colour-convert, rotate and flip raw video frames.
- * Scaling and format conversion are driven by caps negotiation; rotation and
- * mirroring are controlled through the #GstRgaConvert:rotation and
- * #GstRgaConvert:flip properties.
+ * Scaling and format conversion are driven by caps negotiation; the image
+ * orientation is controlled through the standard
+ * #GstVideoDirection:video-direction property (the same property videoflip
+ * uses, so rgaconvert works as a hardware drop-in replacement for it).
  *
  * <refsect2>
  * <title>Example launch lines</title>
@@ -32,15 +33,16 @@
  * ]|
  * convert 1920x1080 ---> 640x480 and NV12 ---> RGBA .
  * |[
- * gst-launch-1.0 -v videotestsrc ! video/x-raw,format=NV12,width=1280,height=720 ! rgaconvert rotation=clockwise-90 ! autovideosink
+ * gst-launch-1.0 -v videotestsrc ! video/x-raw,format=NV12,width=1280,height=720 ! rgaconvert video-direction=90r ! autovideosink
  * ]|
  * rotate the stream 90 degrees clockwise (the output size 720x1280 is chosen
- * automatically; rotation=counterclockwise-90 and rotation=180 are also
+ * automatically; 90l, 180 and the diagonal flips ul-lr / ur-ll are also
  * supported).
  * |[
- * gst-launch-1.0 -v videotestsrc ! rgaconvert flip=horizontal ! autovideosink
+ * gst-launch-1.0 -v videotestsrc ! rgaconvert video-direction=horiz ! autovideosink
  * ]|
- * mirror the stream horizontally.
+ * mirror the stream horizontally. With video-direction=auto the orientation
+ * follows the image-orientation tag carried by the stream.
  * </refsect2>
  */
 
@@ -64,81 +66,11 @@ GST_DEBUG_CATEGORY_STATIC(gst_rga_convert_debug_category);
     case a:                   \
         return b
 
-#define DEFAULT_ROTATION GST_RGA_CONVERT_ROTATE_0
-#define DEFAULT_FLIP     GST_RGA_CONVERT_FLIP_NONE
-
 enum
 {
     PROP_0,
-    PROP_ROTATION,
-    PROP_FLIP,
+    PROP_VIDEO_DIRECTION,
 };
-
-/*
- * Rotation property values. The numeric values are clockwise degrees so that
- * e.g. "rotation=90" keeps working, while the GEnumValue nicks make the
- * direction explicit. RGA's IM_HAL_TRANSFORM_ROT_* follows the Android HAL
- * convention where ROT_90 is a clockwise rotation, so a 90 degree
- * counter-clockwise rotation is ROT_270.
- */
-typedef enum
-{
-    GST_RGA_CONVERT_ROTATE_0   = 0,
-    GST_RGA_CONVERT_ROTATE_90  = 90,  /* 90 degrees clockwise */
-    GST_RGA_CONVERT_ROTATE_180 = 180,
-    GST_RGA_CONVERT_ROTATE_270 = 270, /* 90 degrees counter-clockwise */
-} GstRgaConvertRotation;
-
-/* flip/mirror property values */
-typedef enum
-{
-    GST_RGA_CONVERT_FLIP_NONE       = 0,
-    GST_RGA_CONVERT_FLIP_HORIZONTAL,
-    GST_RGA_CONVERT_FLIP_VERTICAL,
-    GST_RGA_CONVERT_FLIP_BOTH,
-} GstRgaConvertFlip;
-
-#define GST_TYPE_RGA_CONVERT_ROTATION (gst_rga_convert_rotation_get_type())
-static GType
-gst_rga_convert_rotation_get_type(void)
-{
-    static GType type = 0;
-    static const GEnumValue values[] = {
-        {GST_RGA_CONVERT_ROTATE_0, "No rotation", "none"},
-        {GST_RGA_CONVERT_ROTATE_90, "Rotate 90 degrees clockwise", "clockwise-90"},
-        {GST_RGA_CONVERT_ROTATE_180, "Rotate 180 degrees", "180"},
-        {GST_RGA_CONVERT_ROTATE_270, "Rotate 90 degrees counter-clockwise", "counterclockwise-90"},
-        {0, NULL, NULL},
-    };
-
-    if (g_once_init_enter(&type))
-    {
-        GType _type = g_enum_register_static("GstRgaConvertRotation", values);
-        g_once_init_leave(&type, _type);
-    }
-    return type;
-}
-
-#define GST_TYPE_RGA_CONVERT_FLIP (gst_rga_convert_flip_get_type())
-static GType
-gst_rga_convert_flip_get_type(void)
-{
-    static GType type = 0;
-    static const GEnumValue values[] = {
-        {GST_RGA_CONVERT_FLIP_NONE, "No flip", "none"},
-        {GST_RGA_CONVERT_FLIP_HORIZONTAL, "Flip horizontally (mirror)", "horizontal"},
-        {GST_RGA_CONVERT_FLIP_VERTICAL, "Flip vertically", "vertical"},
-        {GST_RGA_CONVERT_FLIP_BOTH, "Flip both horizontally and vertically", "both"},
-        {0, NULL, NULL},
-    };
-
-    if (g_once_init_enter(&type))
-    {
-        GType _type = g_enum_register_static("GstRgaConvertFlip", values);
-        g_once_init_leave(&type, _type);
-    }
-    return type;
-}
 
 /* prototypes */
 
@@ -146,6 +78,9 @@ static void gst_rga_convert_set_property(GObject *object, guint prop_id,
                                          const GValue *value, GParamSpec *pspec);
 static void gst_rga_convert_get_property(GObject *object, guint prop_id,
                                          GValue *value, GParamSpec *pspec);
+
+static gboolean gst_rga_convert_sink_event(GstBaseTransform *trans,
+                                           GstEvent *event);
 
 static GstCaps *gst_rga_convert_transform_caps(
     GstBaseTransform *trans, GstPadDirection direction, GstCaps *caps,
@@ -207,7 +142,10 @@ static GstFlowReturn gst_rga_convert_transform_frame(GstVideoFilter *filter,
 
 /* class initialization */
 
+/* The GstVideoDirection interface has no vfuncs; implementing it only makes
+ * the standard "video-direction" property available for overriding. */
 G_DEFINE_TYPE_WITH_CODE(GstRgaConvert, gst_rga_convert, GST_TYPE_VIDEO_FILTER,
+                        G_IMPLEMENT_INTERFACE(GST_TYPE_VIDEO_DIRECTION, NULL)
                         GST_DEBUG_CATEGORY_INIT(gst_rga_convert_debug_category, "rgaconvert", 0,
                                                 "debug category for rgaconvert element"));
 
@@ -235,26 +173,15 @@ gst_rga_convert_class_init(GstRgaConvertClass *klass)
     gobject_class->set_property = gst_rga_convert_set_property;
     gobject_class->get_property = gst_rga_convert_get_property;
 
-    g_object_class_install_property(
-        gobject_class, PROP_ROTATION,
-        g_param_spec_enum("rotation", "Rotation",
-                          "Rotation to apply to the image (clockwise-90, "
-                          "counterclockwise-90 or 180 degrees)",
-                          GST_TYPE_RGA_CONVERT_ROTATION, DEFAULT_ROTATION,
-                          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
-    g_object_class_install_property(
-        gobject_class, PROP_FLIP,
-        g_param_spec_enum("flip", "Flip",
-                          "Mirror/flip to apply to the image",
-                          GST_TYPE_RGA_CONVERT_FLIP, DEFAULT_FLIP,
-                          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    g_object_class_override_property(gobject_class, PROP_VIDEO_DIRECTION,
+                                     "video-direction");
 
     /* A rotation/flip request must run through the hardware even when the
      * input and output caps are identical, so the same-caps passthrough
      * optimisation cannot be used. */
     base_transform_class->passthrough_on_same_caps = FALSE;
 
+    base_transform_class->sink_event         = GST_DEBUG_FUNCPTR(gst_rga_convert_sink_event);
     base_transform_class->transform_caps     = GST_DEBUG_FUNCPTR(gst_rga_convert_transform_caps);
     base_transform_class->fixate_caps        = GST_DEBUG_FUNCPTR(gst_rga_convert_fixate_caps);
     base_transform_class->decide_allocation  = GST_DEBUG_FUNCPTR(gst_rga_convert_decide_allocation);
@@ -262,6 +189,50 @@ gst_rga_convert_class_init(GstRgaConvertClass *klass)
 
     video_filter_class->set_info        = GST_DEBUG_FUNCPTR(gst_rga_convert_set_info);
     video_filter_class->transform_frame = GST_DEBUG_FUNCPTR(gst_rga_convert_transform_frame);
+}
+
+/*
+ * Record a new orientation request (from the property or from an
+ * image-orientation tag) and resolve the method that is actually applied.
+ * When the effective orientation changes, ask the base class to renegotiate
+ * the source caps since a 90/270 degree method changes the output size.
+ */
+static void
+gst_rga_convert_set_method(GstRgaConvert *rgaconvert,
+                           GstVideoOrientationMethod method, gboolean from_tag)
+{
+    GstVideoOrientationMethod active;
+
+    GST_OBJECT_LOCK(rgaconvert);
+
+    if (method == GST_VIDEO_ORIENTATION_CUSTOM)
+    {
+        GST_WARNING_OBJECT(rgaconvert,
+                           "unsupported custom orientation, using identity");
+        method = GST_VIDEO_ORIENTATION_IDENTITY;
+    }
+
+    if (from_tag)
+        rgaconvert->tag_method = method;
+    else
+        rgaconvert->video_direction = method;
+
+    active = rgaconvert->video_direction == GST_VIDEO_ORIENTATION_AUTO
+                 ? rgaconvert->tag_method
+                 : rgaconvert->video_direction;
+
+    if (active == rgaconvert->active_method)
+    {
+        GST_OBJECT_UNLOCK(rgaconvert);
+        return;
+    }
+
+    GST_DEBUG_OBJECT(rgaconvert, "video direction %d -> %d",
+                     rgaconvert->active_method, active);
+    rgaconvert->active_method = active;
+    GST_OBJECT_UNLOCK(rgaconvert);
+
+    gst_base_transform_reconfigure_src(GST_BASE_TRANSFORM(rgaconvert));
 }
 
 static void
@@ -272,11 +243,8 @@ gst_rga_convert_set_property(GObject *object, guint prop_id,
 
     switch (prop_id)
     {
-    case PROP_ROTATION:
-        rgaconvert->rotation = g_value_get_enum(value);
-        break;
-    case PROP_FLIP:
-        rgaconvert->flip = g_value_get_enum(value);
+    case PROP_VIDEO_DIRECTION:
+        gst_rga_convert_set_method(rgaconvert, g_value_get_enum(value), FALSE);
         break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -292,11 +260,10 @@ gst_rga_convert_get_property(GObject *object, guint prop_id,
 
     switch (prop_id)
     {
-    case PROP_ROTATION:
-        g_value_set_enum(value, rgaconvert->rotation);
-        break;
-    case PROP_FLIP:
-        g_value_set_enum(value, rgaconvert->flip);
+    case PROP_VIDEO_DIRECTION:
+        GST_OBJECT_LOCK(rgaconvert);
+        g_value_set_enum(value, rgaconvert->video_direction);
+        GST_OBJECT_UNLOCK(rgaconvert);
         break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -304,43 +271,121 @@ gst_rga_convert_get_property(GObject *object, guint prop_id,
     }
 }
 
-/* Translate the rotation/flip properties into RGA im2d usage flags. */
-static int
-gst_rga_convert_build_usage(GstRgaConvert *rgaconvert)
+/*
+ * Map a GST_TAG_IMAGE_ORIENTATION string to the orientation method that fixes
+ * it for display. Same table as gst_video_orientation_from_tag(), inlined so
+ * the plugin keeps building against GStreamer < 1.20. Per the tag definition
+ * "flip-rotate-N" means mirror horizontally, then rotate N degrees clockwise:
+ * flip-rotate-90 is the ur-ll transpose (EXIF 7), flip-rotate-270 the ul-lr
+ * transpose (EXIF 5).
+ */
+static gboolean
+gst_rga_convert_orientation_from_tag(const gchar *orientation,
+                                     GstVideoOrientationMethod *method)
 {
-    int usage = IM_SYNC;
-
-    switch (rgaconvert->rotation)
+    static const struct
     {
-    case GST_RGA_CONVERT_ROTATE_90:
-        usage |= IM_HAL_TRANSFORM_ROT_90;
-        break;
-    case GST_RGA_CONVERT_ROTATE_180:
-        usage |= IM_HAL_TRANSFORM_ROT_180;
-        break;
-    case GST_RGA_CONVERT_ROTATE_270:
-        usage |= IM_HAL_TRANSFORM_ROT_270;
-        break;
-    default:
-        break;
+        const gchar *             tag;
+        GstVideoOrientationMethod method;
+    } table[] = {
+        {"rotate-0", GST_VIDEO_ORIENTATION_IDENTITY},
+        {"rotate-90", GST_VIDEO_ORIENTATION_90R},
+        {"rotate-180", GST_VIDEO_ORIENTATION_180},
+        {"rotate-270", GST_VIDEO_ORIENTATION_90L},
+        {"flip-rotate-0", GST_VIDEO_ORIENTATION_HORIZ},
+        {"flip-rotate-90", GST_VIDEO_ORIENTATION_UR_LL},
+        {"flip-rotate-180", GST_VIDEO_ORIENTATION_VERT},
+        {"flip-rotate-270", GST_VIDEO_ORIENTATION_UL_LR},
+    };
+
+    for (gsize i = 0; i < G_N_ELEMENTS(table); i++)
+    {
+        if (g_str_equal(orientation, table[i].tag))
+        {
+            *method = table[i].method;
+            return TRUE;
+        }
     }
 
-    switch (rgaconvert->flip)
+    return FALSE;
+}
+
+/* Track image-orientation tags so video-direction=auto can follow them. The
+ * event is always chained up, so the tag still travels downstream. */
+static gboolean
+gst_rga_convert_sink_event(GstBaseTransform *trans, GstEvent *event)
+{
+    GstRgaConvert *rgaconvert = GST_RGA_CONVERT(trans);
+
+    if (GST_EVENT_TYPE(event) == GST_EVENT_TAG)
     {
-    case GST_RGA_CONVERT_FLIP_HORIZONTAL:
-        usage |= IM_HAL_TRANSFORM_FLIP_H;
-        break;
-    case GST_RGA_CONVERT_FLIP_VERTICAL:
-        usage |= IM_HAL_TRANSFORM_FLIP_V;
-        break;
-    case GST_RGA_CONVERT_FLIP_BOTH:
-        usage |= IM_HAL_TRANSFORM_FLIP_H_V;
-        break;
-    default:
-        break;
+        GstTagList *taglist;
+        gchar *     orientation;
+
+        gst_event_parse_tag(event, &taglist);
+        if (gst_tag_list_get_string(taglist, GST_TAG_IMAGE_ORIENTATION,
+                                    &orientation))
+        {
+            GstVideoOrientationMethod method;
+
+            if (gst_rga_convert_orientation_from_tag(orientation, &method))
+                gst_rga_convert_set_method(rgaconvert, method, TRUE);
+            else
+                GST_WARNING_OBJECT(rgaconvert,
+                                   "unknown image-orientation tag \"%s\"", orientation);
+            g_free(orientation);
+        }
     }
 
-    return usage;
+    return GST_BASE_TRANSFORM_CLASS(gst_rga_convert_parent_class)
+        ->sink_event(trans, event);
+}
+
+/*
+ * Translate the active orientation method into RGA im2d usage flags. RGA's
+ * IM_HAL_TRANSFORM_ROT_* follows the Android HAL convention where ROT_90 is a
+ * clockwise rotation. The two diagonal transposes compose a rotation with a
+ * mirror in a single blit; RGA applies the rotation first and then the mirror
+ * (verified against videoflip output on RK35xx hardware, librga 1.10.1).
+ */
+static int
+gst_rga_convert_build_usage(GstVideoOrientationMethod method)
+{
+    switch (method)
+    {
+        GST_CASE_RETURN(GST_VIDEO_ORIENTATION_90R, IM_SYNC | IM_HAL_TRANSFORM_ROT_90);
+        GST_CASE_RETURN(GST_VIDEO_ORIENTATION_180, IM_SYNC | IM_HAL_TRANSFORM_ROT_180);
+        GST_CASE_RETURN(GST_VIDEO_ORIENTATION_90L, IM_SYNC | IM_HAL_TRANSFORM_ROT_270);
+        GST_CASE_RETURN(GST_VIDEO_ORIENTATION_HORIZ, IM_SYNC | IM_HAL_TRANSFORM_FLIP_H);
+        GST_CASE_RETURN(GST_VIDEO_ORIENTATION_VERT, IM_SYNC | IM_HAL_TRANSFORM_FLIP_V);
+        GST_CASE_RETURN(GST_VIDEO_ORIENTATION_UL_LR, IM_SYNC | IM_HAL_TRANSFORM_ROT_90 | IM_HAL_TRANSFORM_FLIP_H);
+        GST_CASE_RETURN(GST_VIDEO_ORIENTATION_UR_LL, IM_SYNC | IM_HAL_TRANSFORM_ROT_90 | IM_HAL_TRANSFORM_FLIP_V);
+    default: /* identity (AUTO is resolved before it gets here) */
+        return IM_SYNC;
+    }
+}
+
+/* 90/270 degree rotations and the diagonal transposes swap width and height. */
+static gboolean
+gst_rga_convert_method_swaps_wh(GstVideoOrientationMethod method)
+{
+    return method == GST_VIDEO_ORIENTATION_90R
+        || method == GST_VIDEO_ORIENTATION_90L
+        || method == GST_VIDEO_ORIENTATION_UL_LR
+        || method == GST_VIDEO_ORIENTATION_UR_LL;
+}
+
+/* Read the orientation actually in effect (never AUTO). */
+static GstVideoOrientationMethod
+gst_rga_convert_get_active_method(GstRgaConvert *rgaconvert)
+{
+    GstVideoOrientationMethod method;
+
+    GST_OBJECT_LOCK(rgaconvert);
+    method = rgaconvert->active_method;
+    GST_OBJECT_UNLOCK(rgaconvert);
+
+    return method;
 }
 
 static RgaSURF_FORMAT gst_gst_format_to_rga_format(GstVideoFormat format)
@@ -613,10 +658,11 @@ static GstCaps *gst_rga_convert_transform_caps(
 
 /*
  * Choose a default output resolution when downstream leaves it open. For a
- * plain converter that is just the input size, but a 90/270 degree rotation
- * swaps width and height so the default output must be swapped too (e.g.
- * 1920x1080 rotated 90 defaults to 1080x1920). An explicit downstream caps
- * filter still wins via gst_structure_fixate_field_nearest_int().
+ * plain converter that is just the input size, but a 90/270 degree method
+ * (including the diagonal transposes) swaps width and height so the default
+ * output must be swapped too (e.g. 1920x1080 rotated 90 defaults to
+ * 1080x1920). An explicit downstream caps filter still wins via
+ * gst_structure_fixate_field_nearest_int().
  */
 static GstCaps *
 gst_rga_convert_fixate_caps(GstBaseTransform *trans, GstPadDirection direction,
@@ -639,8 +685,8 @@ gst_rga_convert_fixate_caps(GstBaseTransform *trans, GstPadDirection direction,
             gint target_w = in_w;
             gint target_h = in_h;
 
-            if (rgaconvert->rotation == GST_RGA_CONVERT_ROTATE_90
-                || rgaconvert->rotation == GST_RGA_CONVERT_ROTATE_270)
+            if (gst_rga_convert_method_swaps_wh(
+                    gst_rga_convert_get_active_method(rgaconvert)))
             {
                 target_w = in_h;
                 target_h = in_w;
@@ -756,8 +802,9 @@ gst_rga_convert_propose_allocation (GstBaseTransform *trans,
 static void
 gst_rga_convert_init(GstRgaConvert *rgaconvert)
 {
-    rgaconvert->rotation = DEFAULT_ROTATION;
-    rgaconvert->flip     = DEFAULT_FLIP;
+    rgaconvert->video_direction = GST_VIDEO_ORIENTATION_IDENTITY;
+    rgaconvert->active_method   = GST_VIDEO_ORIENTATION_IDENTITY;
+    rgaconvert->tag_method      = GST_VIDEO_ORIENTATION_IDENTITY;
 }
 
 static gboolean
@@ -809,7 +856,8 @@ gst_rga_convert_transform_frame(GstVideoFilter *filter, GstVideoFrame *inframe,
         goto out;
     }
 
-    usage = gst_rga_convert_build_usage(rgaconvert);
+    usage = gst_rga_convert_build_usage(
+        gst_rga_convert_get_active_method(rgaconvert));
 
     /* Validate the requested operation against the RGA hardware limits. */
     status = imcheck(src.buffer, dst.buffer, empty_rect, empty_rect, usage);
