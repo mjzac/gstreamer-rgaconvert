@@ -41,10 +41,18 @@ reads BGRx. Zero-copy here therefore means:
 ## Scope decisions (settled during brainstorming)
 
 - **Full zero-copy negotiation** at the *allocation layer*, not the caps layer.
-- Caps stay plain `video/x-raw`. The `memory:DMABuf` caps feature is **not**
-  used: it signals non-CPU-mappable memory (GL/EGL/kms consumers), but appsink
-  must map and read the bytes. A dma-buf-backed `GstMemory` is still
-  CPU-mappable, so plain caps + dma-buf memory is the correct pattern here.
+- Caps stay plain `video/x-raw` *for the v4l2src→appsink path*. A dma-buf-backed
+  `GstMemory` is still CPU-mappable, so plain caps + dma-buf memory is the
+  correct pattern for that CPU consumer.
+
+  **Update (2026-06-06):** both pads now *also* advertise the
+  `video/x-raw(memory:DMABuf)` caps feature, negotiated independently per pad
+  (see `gst_rga_convert_transform_caps`). This is required to link decoders that
+  signal dma-buf at the caps layer (`mppvideodec`, `mppjpegdec`) — they
+  otherwise fail with `rgaconvert can't handle caps video/x-raw(memory:DMABuf)`
+  — and lets `rgaconvert` hand its dma-buf output zero-copy to a dma-buf consumer
+  (e.g. `kmssink`). Plain `video/x-raw` is still offered, so the appsink CPU
+  path is unchanged.
 - **Output buffers are self-allocated** dma-bufs (appsink offers no dma-buf
   pool), with graceful fallback to the existing CPU path if the heap can't be
   opened.
@@ -173,8 +181,9 @@ mostly integration; strict test-first is impractical for the RGA blit itself.
 
 ## Out of scope
 
-- `memory:DMABuf` caps feature for opaque downstream (kmssink/GL) — not needed
-  for an appsink CPU consumer; possible future extension.
+- ~~`memory:DMABuf` caps feature for opaque downstream (kmssink/GL)~~ —
+  **implemented 2026-06-06** (both pads advertise the feature; see the scope
+  update above).
 - Cached heap + `DMA_BUF_IOCTL_SYNC` fast-read path — possible future
   optimisation if uncached CPU reads prove too slow.
 - Proactively proposing an upstream dma-buf pool for `dmabuf-import` cameras —

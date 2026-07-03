@@ -169,22 +169,40 @@ static GstFlowReturn gst_rga_convert_transform_frame(GstVideoFilter *filter,
 
 /* pad templates */
 
-#define VIDEO_SRC_CAPS                                                                             \
-    "video/x-raw, "                                                                                \
-    "format = (string) "                                                                           \
-    "{ I420, YV12, NV12, NV21, Y42B, NV16, NV61, RGB16, RGB15, BGR, RGB, BGRA, RGBA, BGRx, RGBx }" \
-    ", "                                                                                           \
-    "width = (int) [ 1, 4096 ] ,"                                                                  \
-    "height = (int) [ 1, 4096 ] ,"                                                                 \
+#define RGA_FORMATS \
+    "{ I420, YV12, NV12, NV21, Y42B, NV16, NV61, RGB16, RGB15, BGR, RGB, BGRA, RGBA, BGRx, RGBx }"
+
+/*
+ * Both pads advertise plain video/x-raw (system memory) *and* the
+ * video/x-raw(memory:DMABuf) caps feature. The DMABuf variant lets dma-buf
+ * producers that signal their memory at the caps layer (e.g. mppvideodec,
+ * mppjpegdec) link to our sink pad, and lets us hand RGA's dma-buf output
+ * zero-copy to a dma-buf consumer (e.g. kmssink) on our src pad. RGA can import
+ * from / write to either memory type, so the feature is negotiated
+ * independently on each pad (see gst_rga_convert_transform_caps).
+ */
+#define VIDEO_SRC_CAPS                                                          \
+    "video/x-raw(" GST_CAPS_FEATURE_MEMORY_DMABUF "), "                         \
+    "format = (string) " RGA_FORMATS ", "                                       \
+    "width = (int) [ 1, 4096 ] ,"                                               \
+    "height = (int) [ 1, 4096 ] ,"                                              \
+    "framerate = (fraction) [ 0, max ] ;"                                       \
+    "video/x-raw, "                                                             \
+    "format = (string) " RGA_FORMATS ", "                                       \
+    "width = (int) [ 1, 4096 ] ,"                                               \
+    "height = (int) [ 1, 4096 ] ,"                                              \
     "framerate = (fraction) [ 0, max ]"
 
-#define VIDEO_SINK_CAPS                                                                            \
-    "video/x-raw, "                                                                                \
-    "format = (string) "                                                                           \
-    "{ I420, YV12, NV12, NV21, Y42B, NV16, NV61, RGB16, RGB15, BGR, RGB, BGRA, RGBA, BGRx, RGBx }" \
-    ", "                                                                                           \
-    "width = (int) [ 1, 8192 ] ,"                                                                  \
-    "height = (int) [ 1, 8192 ] ,"                                                                 \
+#define VIDEO_SINK_CAPS                                                         \
+    "video/x-raw(" GST_CAPS_FEATURE_MEMORY_DMABUF "), "                         \
+    "format = (string) " RGA_FORMATS ", "                                       \
+    "width = (int) [ 1, 8192 ] ,"                                               \
+    "height = (int) [ 1, 8192 ] ,"                                              \
+    "framerate = (fraction) [ 0, max ] ;"                                       \
+    "video/x-raw, "                                                             \
+    "format = (string) " RGA_FORMATS ", "                                       \
+    "width = (int) [ 1, 8192 ] ,"                                               \
+    "height = (int) [ 1, 8192 ] ,"                                              \
     "framerate = (fraction) [ 0, max ]"
 
 /* class initialization */
@@ -484,6 +502,28 @@ gst_rga_frame_release(GstRgaFrame *rga_frame, GstVideoFrame *frame)
         gst_buffer_unmap(frame->buffer, &rga_frame->map_info);
 }
 
+/*
+ * Append 'structure' to 'caps' tagged with the named caps feature (NULL for the
+ * default system-memory feature), skipping it when an equal-or-broader
+ * structure is already present. The caller retains ownership of 'structure'.
+ */
+static void
+gst_rga_convert_append_with_feature(GstCaps *caps, const GstStructure *structure,
+                                    const gchar *feature_name)
+{
+    GstCapsFeatures *features =
+        feature_name ? gst_caps_features_new(feature_name, NULL) : NULL;
+
+    if (gst_caps_is_subset_structure_full(caps, structure, features))
+    {
+        if (features)
+            gst_caps_features_free(features);
+        return;
+    }
+
+    gst_caps_append_structure_full(caps, gst_structure_copy(structure), features);
+}
+
 static GstCaps *gst_rga_convert_transform_caps(
     GstBaseTransform *trans, GstPadDirection direction, GstCaps *caps,
     GstCaps *filter)
@@ -505,11 +545,6 @@ static GstCaps *gst_rga_convert_transform_caps(
     {
         structure = gst_caps_get_structure(caps, i);
         features = gst_caps_get_features(caps, i);
-
-        /* If this is already expressed by the existing caps
-         * skip this structure */
-        if (i > 0 && gst_caps_is_subset_structure_full(ret, structure, features))
-            continue;
 
         /* make copy */
         structure = gst_structure_copy(structure);
@@ -543,12 +578,23 @@ static GstCaps *gst_rga_convert_transform_caps(
                               4096,
                               NULL);
         }
-        if (!gst_caps_features_is_any(features))
+
+        if (gst_caps_features_is_any(features))
         {
-            gst_structure_remove_fields(structure, "format", "colorimetry", "chroma-site", NULL);
+            /* Wildcard features: keep the structure (and its format) verbatim. */
+            gst_caps_append_structure_full(ret, structure, gst_caps_features_copy(features));
+            continue;
         }
 
-        gst_caps_append_structure_full(ret, structure, gst_caps_features_copy(features));
+        /* RGA converts pixel format and can import from / write to either system
+         * memory or a dma-buf, so the other pad's format and memory type are not
+         * constrained by this structure. Drop the format and offer both the
+         * system-memory and the dma-buf variants. */
+        gst_structure_remove_fields(structure, "format", "colorimetry", "chroma-site", NULL);
+
+        gst_rga_convert_append_with_feature(ret, structure, NULL);
+        gst_rga_convert_append_with_feature(ret, structure, GST_CAPS_FEATURE_MEMORY_DMABUF);
+        gst_structure_free(structure);
     }
 
     if (filter) {
