@@ -1,0 +1,4 @@
+build/
+packaging/build/
+packaging/*.deb
+.claude/settings.local.json
